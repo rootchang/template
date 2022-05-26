@@ -1,0 +1,410 @@
+---
+title: "Gene mean prediction"
+author: "Yingying Cao"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{GSE139324_HNSC}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+# clear all objects including hidden objects
+rm(list = ls(all.names = TRUE)) 
+# free up memory and report the memory usage
+gc()
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      comment = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE)
+# useful functions to process scRNAseq data
+source("./Rutils/scRNAseq.utils.R")
+# useful functions to do prediction
+source("./Rutils/Prediction.utils.R")
+require(ggplot2)
+ggplot2::theme_set(new = theme_bw(base_size = 12)) # sets the theme and axis font size
+```
+
+
+# Aims:
+
+- prediction TIL cell type gene expression levels from PBMC  cell type specific gene expression (or sd) information, patient information
+
+
+
+```{r}
+# load required package
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(ggpubr)
+library(genefilter)
+library(dplyr)
+library(caret)
+library(tidyverse)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(splitstackshape)
+library(patchwork)
+library(pheatmap)
+library(ranger)
+library(RColorBrewer)
+library(glmnet)
+```
+
+
+# set the color scale
+
+```{r}
+my.cols <- c("#7CD5C8FF", "#507D41FF", "#DF8F44FF", "#6A6599FF", "#CB7C77FF", "#6B42C8FF",
+             "#C9D73DFF", "#C555CBFF", "#AED688FF", "#502E71FF", "#C49A3FFF",
+             "#42B540FF", "#0099B4FF", "#925E9FFF", 
+             "#FDAF91FF", "#AD002AFF", "#00468BFF", "#ED0000FF",
+             "#6A7DC9FF", "#D7652DFF", 
+             "#CF4C8BFF", "#5D8D9CFF", "#722E41FF", "#C8B693FF", "#C5383CFF", "#79AF97FF", "#68D359FF")
+feature.pal = rev(colorRampPalette(brewer.pal(11,"Spectral"))(50))
+
+```
+
+```{r}
+# Set directories & parameters
+filter_cell_num <- 1
+data_dir <- "../data/"
+processed_dir <- "../processed/"
+main_fig_dir <- "../Manuscript_Figures/"
+qc_fig_dir <- "../Manuscript_Figures/QC/"
+pred_fig_dir <- "../Manuscript_Figures/Prediction/"
+table_dir <- "../Manuscript_Tables/"
+pred_table_dir <- "../Manuscript_Tables/Prediction/"
+```
+
+
+# load data
+```{r}
+# gene expression sd
+logcounts_sd <- readRDS(file =  paste0(table_dir, "logcounts.sd.", filter_cell_num, ".rds"))
+
+sample_name_df <- data.frame(str_split_fixed(colnames(logcounts_sd), "_", 4))
+sample_names <- unique(paste(sample_name_df$X1, sample_name_df$X2, sep = "_"))
+cell_names <- unique(sample_name_df$X4)
+cellTypeNUM = length(cell_names)
+all_patientNUM = length(sample_names)
+
+# gene expression mean
+logcounts_mean <- readRDS(file =  paste0(table_dir, "logcounts.mean.", filter_cell_num, ".rds"))
+
+# cell type abundance data
+proportions <- readRDS(file = paste0(table_dir, "Celltype.proportions.rds"))
+
+# gene expression bulk sums PCs
+logcounts_b_bulk <- readRDS(file =  paste0(table_dir, "logcounts.sum.b.sums.", filter_cell_num, ".rds"))
+logcounts_b_bulk <- logcounts_b_bulk[, sample_names] # re-order the columns
+
+# patient information
+patient_info <- readRDS(file = paste0(processed_dir, "patient_info.rds"))
+
+# target tissue sample information whether a cell type exists or not
+existance_t <- readRDS(file = paste0(table_dir, "Celltype.existance.t.", filter_cell_num, ".rds"))
+
+# remove target genes that most of expression values are zero
+logcounts_mean <- logcounts_mean[rowSums(logcounts_mean > 0) > 0.5*ncol(logcounts_mean),]
+logcounts_sd <- logcounts_sd[rowSums(logcounts_sd > 0) > 0.5*ncol(logcounts_sd),]
+logcounts_b_bulk <- logcounts_b_bulk[rowSums(logcounts_b_bulk > 0) > 0.5*ncol(logcounts_b_bulk),]
+
+gene_mean_names <- rownames(logcounts_mean)
+gene_sd_names <- rownames(logcounts_sd)
+
+```
+
+
+
+# prediction with lasso
+```{r}
+library(doMC)
+registerDoMC(cores=7)
+require(statmod)
+library(e1071)
+###################### Running parameters setting ##############################
+repeatNUM = 10  # how many repeats needed
+useBulk = FALSE # whether to use bulk or cell-type specific blood RNA-seq
+useHigh_variable_gene = TRUE
+modelUsed = 'LASSO' # Whether to use 'ElasticNet', 'LASSO' or 'SVM'
+high_variable_gene_num = 2000
+top_PCC_gene_num = 50
+predict_mean_or_sd = 'sd' # to predict gene_expression_mean or gene_expression_sd
+################################################################################
+
+start_time <- Sys.time()
+
+if (predict_mean_or_sd == 'mean'){
+  logcounts = logcounts_mean
+  gene_names = gene_mean_names
+}else if (predict_mean_or_sd == 'sd'){
+  logcounts = logcounts_sd
+  gene_names = gene_sd_names
+}
+
+complete_names_b = expand.grid(paste(sample_names,'PBMC',sep='_'), cell_names)
+complete_names_t = expand.grid(paste(sample_names,'TIL',sep='_'), cell_names)
+complete_names = rbind(complete_names_b, complete_names_t)
+complete_names <- paste(complete_names$Var1, complete_names$Var2, sep = "_")
+
+################ Make logcounts a complete data matrix by add NA to missing samples for all cell types
+################ Namely, all cell types will have columnNum = (52 samples * 19 cell types) afterwards
+logcounts_temp = data.frame(matrix(data = NA, nrow = length(gene_names), ncol = length(complete_names)))
+colnames(logcounts_temp) = complete_names
+for (cellNA in cell_names){
+  for (sampleNA in sample_names){
+    colNA_blood = paste(sampleNA,'PBMC',cellNA,sep='_')
+    colNA_tumor = paste(sampleNA,'TIL',cellNA,sep='_')
+    if (sum(grepl(colNA_blood,colnames(logcounts)))<0.5){ # blood data not found in logcounts
+      logcounts_temp[[colNA_blood]]=NA
+      next
+    }
+    if (sum(grepl(colNA_tumor,colnames(logcounts)))<0.5){ # tumor data not found in logcounts
+      logcounts_temp[[colNA_tumor]]=NA
+      next
+    }
+    logcounts_temp[colNA_blood] = logcounts[colNA_blood]
+    logcounts_temp[colNA_tumor] = logcounts[colNA_tumor]
+  }
+}
+rownames(logcounts_temp) = gene_names
+logcounts = logcounts_temp
+rm(logcounts_temp) # delete useless variable to save memory
+
+################ Divide logcounts by cell types and tissue types (tumor/blood)
+logcounts_b <- logcounts[,grepl("_PBMC_", colnames(logcounts))]
+logcounts_t <- logcounts[,grepl("_TIL_", colnames(logcounts))]
+logcounts_b_list = vector(mode = "list", length = cellTypeNUM)
+logcounts_t_list = vector(mode = "list", length = cellTypeNUM)
+for (cell_i in 1:cellTypeNUM) {
+  logcounts_b_list[[cell_i]] = logcounts_b[,((cell_i-1)*all_patientNUM+1):(cell_i*all_patientNUM)]
+  logcounts_t_list[[cell_i]] = logcounts_t[,((cell_i-1)*all_patientNUM+1):(cell_i*all_patientNUM)]
+}
+sample_colNames = colnames(logcounts_b_list[[1]])
+
+#rownames(logcounts_t) <- paste0(rownames(logcounts_t), "_t")
+
+
+####### repeat resampling and prediction
+results_repeats <- list() # store all results (PCC, SCC, NRMSE, lambda)
+for (repeat_i in 1:repeatNUM) { 
+  results_cells <- list() # store all prediction metrics (PCC, SCC, NRMSE, lambda) for each cell type
+  
+  ###################################################################################################
+  ################################ 1.split data into training and test ##############################
+  train_info <- stratified(patient_info, c('hpv_status', 'Sex', 'TobaccoUse', 'AlcoholUse'), size = 0.7, replace = FALSE)
+  train_ind = grepl(paste(paste0(train_info$patient_id,"_"), collapse="|"),sample_colNames)
+  train_patientNUM = length(train_info$patient_id)
+  test_patientNUM = length(sample_names) - train_patientNUM
+  
+  ###################################################################################################
+  ########################## 2. select/filter for high variable genes  ##############################
+  if (useBulk == TRUE) {
+    x_train0 = logcounts_b_bulk[, train_ind]
+    x_test0 = logcounts_b_bulk[, !train_ind]
+    if (useHigh_variable_gene == TRUE) { # select highly variable genes (from bulk RNA-seq)
+      x_train_temp = logcounts_b_bulk[, train_ind]
+      x_train_mean = rowMeans(x_train_temp, na.rm = TRUE)
+      x_train_var = apply(x_train_temp,1,function(x) var(x,na.rm = TRUE))
+      coef_var_square = x_train_var/x_train_mean^2 # coefficient of variation, measures relative dispersion of data around the mean
+      min_mean = unname( quantile( x_train_mean[ which( coef_var_square > .3 ) ], .95 ) )
+      useForFit = x_train_mean >= min_mean
+      fit = glmgam.fit( cbind( a0 = 1, a1tilde = 1/x_train_mean[useForFit] ),coef_var_square[useForFit] )
+      a0 = unname( fit$coefficients["a0"] )
+      a1 = unname( fit$coefficients["a1tilde"])
+      afit = a1/x_train_mean+a0
+      varFitRatio = x_train_var/(afit*x_train_mean^2)
+      varorder = order(varFitRatio,decreasing=T)
+      x_train0 = x_train_temp[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
+    }
+  }
+  for (cell_i in 1:cellTypeNUM) { # cellTypeNUM
+    cell_i_NA = cell_names[cell_i] 
+    print(paste0("I am analyzing resampling times: ", repeat_i, ", cell type: ", cell_i_NA))
+    y_train = logcounts_t_list[[cell_i]][, train_ind]
+    y_test = logcounts_t_list[[cell_i]][, !train_ind]
+    if (sum(is.na(y_test[1,]))>=4 | sum(is.na(y_train[1,]))>=17) { # less than 3 observations will cause error during PCC calculation
+      #print(paste(cell_names[cell_i],'failed'))
+      next
+    }
+    if (useBulk == FALSE){
+      x_train0 = logcounts_b_list[[cell_i]][, train_ind]
+      x_test0 = logcounts_b_list[[cell_i]][, !train_ind]
+      if (useHigh_variable_gene == TRUE) { # select highly variable genes (from same cell-type RNA-seq)
+        x_train_temp = logcounts_b_list[[cell_i]][, train_ind]
+        x_train_mean = rowMeans(x_train_temp, na.rm = TRUE)
+        x_train_var = apply(x_train_temp,1,function(x) var(x,na.rm = TRUE))
+        coef_var_square = x_train_var/x_train_mean^2 # coefficient of variation, measures relative dispersion of data around the mean
+        min_mean = unname( quantile( x_train_mean[ which( coef_var_square > .3 ) ], .95 ) )
+        useForFit = x_train_mean >= min_mean
+        fit = glmgam.fit( cbind( a0 = 1, a1tilde = 1/x_train_mean[useForFit] ),coef_var_square[useForFit] )
+        a0 = unname( fit$coefficients["a0"] )
+        a1 = unname( fit$coefficients["a1tilde"])
+        afit = a1/x_train_mean+a0
+        varFitRatio = x_train_var/(afit*x_train_mean^2)
+        varorder = order(varFitRatio,decreasing=T)
+        x_train0 = x_train_temp[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
+      }
+    }
+    
+    ###################################################################################################
+    ################################ 3. high correlated genes from every cell type ####################
+    sampleNA_df <- data.frame(str_split_fixed(colnames(x_train0), "_", n = 4))
+    sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
+    colnames(x_train0) <- sampleNA # only keep sample names, leave out cell names
+    sampleNA_df <- data.frame(str_split_fixed(colnames(y_train), "_", n = 4))
+    sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
+    colnames(y_train) <- sampleNA # only keep sample names, leave out cell names
+    sampleNA_df <- data.frame(str_split_fixed(colnames(x_test0), "_", n = 4))
+    sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
+    colnames(x_test0) <- sampleNA # only keep sample names, leave out cell names
+    sampleNA_df <- data.frame(str_split_fixed(colnames(y_test), "_", n = 4))
+    sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
+    colnames(y_test) <- sampleNA # only keep sample names, leave out cell names
+    
+    PCC_all = cor(t(x_train0), t(y_train), use='complete.obs')
+    y_train = t(y_train)
+    y_train = y_train[complete.cases(y_train),]
+    x_train = t(x_train0)
+    x_train = x_train[grepl(paste(paste0(rownames(y_train),"$"), collapse="|"),rownames(x_train)), ] # delete samples that are absent in y_train
+    y_test = t(y_test)
+    y_test = y_test[complete.cases(y_test),]
+    x_test = t(x_test0)
+    x_test = x_test[grepl(paste(paste0(rownames(y_test),"$"), collapse="|"),rownames(x_test)), ] # delete samples that are absent in y_test
+    genes_run = gene_names#[1:10]
+    metrics <- foreach (gene = genes_run, .inorder = T, .combine = rbind) %dopar% {
+    #for (gene in gene_names[1:2]) {
+      ############ Top-N PCC genes as predictors #############
+      y_train_1gene = y_train[,gene]
+      y_test_1gene = y_test[,gene]
+      print(y_test_1gene)
+      PCC_1gene = PCC_all[,gene]
+      top50 = names(PCC_1gene[order(PCC_1gene, decreasing = TRUE)[1:top_PCC_gene_num]])
+      x_train_1gene = x_train[,top50]
+      x_test_1gene = x_test[,top50]
+      if (length(table(as.matrix(y_test_1gene)))<2 | length(table(as.matrix(y_train_1gene)))<3){ # if <2 observations, will cause error in calculating PCC
+                                            # notice that in training set, we need to do CV by leaving-1-out.
+        result = list()
+        result[["PCC"]] = NA
+        result[["SCC"]] = NA
+        result[["NRMSE"]] = NA
+        #next
+        return(result)
+      }
+      if (modelUsed == 'ElasticNet'){
+        ######################## The ElasticNet model (not work) ########################
+        lambdas = 10^seq(2, -3, by = -.2)
+        alphas = seq(0,5,0.2)
+        cvfit = cv.glmnet(data.matrix(x_train_1gene), y_train_1gene, ranges = list(alpha = alphas, lambda = lambdas), 
+                          nfolds = nrow(x_train_1gene), # leave one out
+                          parallel = TRUE)
+        lambda_best = cvfit$lambda.min
+        alpha_best = cvfit$alpha.min
+        model = glmnet(data.matrix(x_train_1gene), y_train_1gene, alpha = alpha_best, lambda = lambda_best)
+        pred_lm_test = predict(model, newx = data.matrix(x_test_1gene))
+      }else if (modelUsed == 'LASSO'){
+        ######################## The LASSO model ########################
+        lambdas = 10^seq(2, -3, by = -.1)
+        cvfit = cv.glmnet(data.matrix(x_train_1gene), y_train_1gene, alpha = 1, lambda = lambdas, 
+                          nfolds = nrow(x_train_1gene), # leave one out
+                          parallel = TRUE)
+        lambda_best = cvfit$lambda.min
+        model = glmnet(data.matrix(x_train_1gene), y_train_1gene, alpha = 1, lambda = lambda_best)
+        pred_lm_test = predict(model, newx = data.matrix(x_test_1gene))
+      }else if (modelUsed == 'SVM'){
+      ######################## The SVM model (not work) ########################
+        gammas = c(0.5)#10^seq(1, -1, by = -.5)
+        costs = c(4)#10^seq(1, -1, by = -.5)
+        data_df = cbind(x_train_1gene,as.data.frame(y_train_1gene))
+        svm_tune <- tune(svm, y_train_1gene~., data = data_df,
+                    ranges = list(gamma = gammas, cost = costs),
+                    tunecontrol = tune.control(nrepeat = 1, sampling = "cross", cross = nrow(x_train_1gene)))
+        gamma_best = svm_tune$best.parameters[[1]]
+        cost_best = svm_tune$best.parameters[[2]]
+        model = svm(y_train_1gene~., data = data_df, gamma = gamma_best, cost = cost_best)
+        pred_lm_test = predict(model, x_test_1gene)
+      }
+      #### prediction performance metrics
+      PCC = cor(y_test_1gene, pred_lm_test, method = "pearson")[1]
+      SCC = cor(y_test_1gene, pred_lm_test, method = "spearman")[1]
+      squared_sums <- sum((y_test_1gene - pred_lm_test)^2)
+      mse <- squared_sums/length(y_test_1gene)
+      rmse <- sqrt(mse)
+      NRMSE <- rmse/mean(y_test_1gene)
+      result = list()
+      result[["PCC"]] = PCC
+      result[["SCC"]] = SCC
+      result[["NRMSE"]] = NRMSE
+      result[['lambda']] = lambda_best
+      return(result)
+    } # foreach end
+    rownames(metrics) = genes_run
+    results_cells[[cell_i_NA]] = metrics
+  } # celltype end
+  results_repeats[[repeat_i]] = results_cells
+} # resampling end
+
+end_time <- Sys.time()
+end_time - start_time
+
+save(results_repeats,
+     file = paste0(pred_table_dir, "Mean_results_repeats_lasso_", filter_cell_num, ".RData"))
+```
+
+# Visualize prediction performance
+```{r}
+load(file = paste0(pred_table_dir, "Mean_results_repeats_lasso_", filter_cell_num, ".RData"))
+```
+
+```{r}
+predicted_cell_names <- c()
+for (repeat_i in 1:repeatNUM) {
+  predicted_cell_names = unique(c(predicted_cell_names, names(results_repeats[[repeat_i]])))
+}
+```
+
+```{r}
+results_repeats_PCC_df = data.frame(matrix(data = NA, nrow = length(gene_names), ncol = 1))
+rownames(results_repeats_PCC_df) = gene_names
+colnames(results_repeats_PCC_df) = "delete"
+
+for (repeat_i in 1:repeatNUM) {
+  for (predicted_cell_i in predicted_cell_names) {
+    results_repeats_PCC_ls <- 
+    
+  }
+}
+```
+
+```{r}
+# train performance
+df.p.train <- reshape2::melt(repeats.cor.p.train)
+colnames(df.p.train) <- c("celltype", "resampling", "p.value")
+
+df.p.train$celltype <-str_replace_all(df.p.train$celltype, c(".plus." = "\\+"))
+df.p.train$celltype <-str_replace_all(df.p.train$celltype, c(".slash." = "/" ))
+df.p.train$celltype <-str_replace_all(df.p.train$celltype, c(".space." = " "))
+df.p.train$celltype <-str_replace_all(df.p.train$celltype, c(".dash." = "-"))
+
+m1 <- ggplot(data = df.p.train, aes(x= reorder(celltype, -p.value, na.rm = TRUE, FUN = median), y=p.value))+
+  #scale_fill_manual(values=my.cols)+
+  geom_violin(alpha=1, position = position_dodge(width = .75),size=1,color="NA", fill = "gray") +
+  geom_boxplot(notch = F, width = 0.5, outlier.size = -1, fill = "gray", color="black", lwd=0.6, alpha = 0.7,show.legend = F)+
+  theme_classic()+
+  labs(title="",x="", y = "Pearson correlation")+
+  theme(legend.position="none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  geom_hline(yintercept=0, linetype="dashed", color = "red")
+```
+
+
+}
