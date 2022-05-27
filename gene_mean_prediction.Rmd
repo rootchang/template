@@ -132,7 +132,7 @@ registerDoMC(cores=7)
 require(statmod)
 library(e1071)
 ###################### Running parameters setting ##############################
-repeatNUM = 10  # how many repeats needed
+repeatNUM = 100  # how many repeats needed
 useBulk = FALSE # whether to use bulk or cell-type specific blood RNA-seq
 useHigh_variable_gene = TRUE
 modelUsed = 'LASSO' # Whether to use 'ElasticNet', 'LASSO' or 'SVM'
@@ -196,7 +196,7 @@ sample_colNames = colnames(logcounts_b_list[[1]])
 
 ####### repeat resampling and prediction
 results_repeats <- list() # store all results (PCC, SCC, NRMSE, lambda)
-for (repeat_i in 1:repeatNUM) { 
+for (repeat_i in 1:repeatNUM) { # repeatNUM
   results_cells <- list() # store all prediction metrics (PCC, SCC, NRMSE, lambda) for each cell type
   
   ###################################################################################################
@@ -205,16 +205,15 @@ for (repeat_i in 1:repeatNUM) {
   train_ind = grepl(paste(paste0(train_info$patient_id,"_"), collapse="|"),sample_colNames)
   train_patientNUM = length(train_info$patient_id)
   test_patientNUM = length(sample_names) - train_patientNUM
-  
   ###################################################################################################
   ########################## 2. select/filter for high variable genes  ##############################
   if (useBulk == TRUE) {
     x_train0 = logcounts_b_bulk[, train_ind]
     x_test0 = logcounts_b_bulk[, !train_ind]
     if (useHigh_variable_gene == TRUE) { # select highly variable genes (from bulk RNA-seq)
-      x_train_temp = logcounts_b_bulk[, train_ind]
-      x_train_mean = rowMeans(x_train_temp, na.rm = TRUE)
-      x_train_var = apply(x_train_temp,1,function(x) var(x,na.rm = TRUE))
+      x_train_all0 = logcounts_b_bulk[, train_ind]
+      x_train_mean = rowMeans(x_train_all0, na.rm = TRUE)
+      x_train_var = apply(x_train_all0,1,function(x) var(x,na.rm = TRUE))
       coef_var_square = x_train_var/x_train_mean^2 # coefficient of variation, measures relative dispersion of data around the mean
       min_mean = unname( quantile( x_train_mean[ which( coef_var_square > .3 ) ], .95 ) )
       useForFit = x_train_mean >= min_mean
@@ -224,10 +223,10 @@ for (repeat_i in 1:repeatNUM) {
       afit = a1/x_train_mean+a0
       varFitRatio = x_train_var/(afit*x_train_mean^2)
       varorder = order(varFitRatio,decreasing=T)
-      x_train0 = x_train_temp[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
+      x_train0 = x_train_all0[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
     }
   }
-  for (cell_i in 1:cellTypeNUM) { # cellTypeNUM
+  for (cell_i in 5:5) { # 1:cellTypeNUM
     cell_i_NA = cell_names[cell_i] 
     print(paste0("I am analyzing resampling times: ", repeat_i, ", cell type: ", cell_i_NA))
     y_train = logcounts_t_list[[cell_i]][, train_ind]
@@ -240,9 +239,9 @@ for (repeat_i in 1:repeatNUM) {
       x_train0 = logcounts_b_list[[cell_i]][, train_ind]
       x_test0 = logcounts_b_list[[cell_i]][, !train_ind]
       if (useHigh_variable_gene == TRUE) { # select highly variable genes (from same cell-type RNA-seq)
-        x_train_temp = logcounts_b_list[[cell_i]][, train_ind]
-        x_train_mean = rowMeans(x_train_temp, na.rm = TRUE)
-        x_train_var = apply(x_train_temp,1,function(x) var(x,na.rm = TRUE))
+        x_train_all0 = logcounts_b_list[[cell_i]][, train_ind]
+        x_train_mean = rowMeans(x_train_all0, na.rm = TRUE)
+        x_train_var = apply(x_train_all0,1,function(x) var(x,na.rm = TRUE))
         coef_var_square = x_train_var/x_train_mean^2 # coefficient of variation, measures relative dispersion of data around the mean
         min_mean = unname( quantile( x_train_mean[ which( coef_var_square > .3 ) ], .95 ) )
         useForFit = x_train_mean >= min_mean
@@ -252,7 +251,7 @@ for (repeat_i in 1:repeatNUM) {
         afit = a1/x_train_mean+a0
         varFitRatio = x_train_var/(afit*x_train_mean^2)
         varorder = order(varFitRatio,decreasing=T)
-        x_train0 = x_train_temp[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
+        x_train0 = x_train_all0[varorder[1:high_variable_gene_num],] # filter for top 2000 genes
       }
     }
     
@@ -261,6 +260,7 @@ for (repeat_i in 1:repeatNUM) {
     sampleNA_df <- data.frame(str_split_fixed(colnames(x_train0), "_", n = 4))
     sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
     colnames(x_train0) <- sampleNA # only keep sample names, leave out cell names
+    colnames(x_train_all0) <- sampleNA # only keep sample names, leave out cell names
     sampleNA_df <- data.frame(str_split_fixed(colnames(y_train), "_", n = 4))
     sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
     colnames(y_train) <- sampleNA # only keep sample names, leave out cell names
@@ -271,26 +271,28 @@ for (repeat_i in 1:repeatNUM) {
     sampleNA <- unique(paste(sampleNA_df$X1, sampleNA_df$X2, sep = "_"))
     colnames(y_test) <- sampleNA # only keep sample names, leave out cell names
     
-    PCC_all = cor(t(x_train0), t(y_train), use='complete.obs')
+    PCC_all = cor(t(x_train0), t(y_train), use='complete.obs', method = "spearman")
     y_train = t(y_train)
     y_train = y_train[complete.cases(y_train),]
     x_train = t(x_train0)
     x_train = x_train[grepl(paste(paste0(rownames(y_train),"$"), collapse="|"),rownames(x_train)), ] # delete samples that are absent in y_train
+    x_train_all = t(x_train_all0)
+    x_train_all = x_train_all[grepl(paste(paste0(rownames(y_train),"$"), collapse="|"),rownames(x_train_all)), ] # delete samples that are absent in y_train
     y_test = t(y_test)
     y_test = y_test[complete.cases(y_test),]
     x_test = t(x_test0)
     x_test = x_test[grepl(paste(paste0(rownames(y_test),"$"), collapse="|"),rownames(x_test)), ] # delete samples that are absent in y_test
     genes_run = gene_names#[1:10]
     metrics <- foreach (gene = genes_run, .inorder = T, .combine = rbind) %dopar% {
-    #for (gene in gene_names[1:2]) {
+    #for (gene in gene_names) {
       ############ Top-N PCC genes as predictors #############
       y_train_1gene = y_train[,gene]
       y_test_1gene = y_test[,gene]
-      print(y_test_1gene)
       PCC_1gene = PCC_all[,gene]
       top50 = names(PCC_1gene[order(PCC_1gene, decreasing = TRUE)[1:top_PCC_gene_num]])
-      x_train_1gene = x_train[,top50]
-      x_test_1gene = x_test[,top50]
+      top50_and_gene_it_self = c(top50, gene)
+      x_train_1gene = x_train_all[,top50_and_gene_it_self]
+      x_test_1gene = x_test[,top50_and_gene_it_self]
       if (length(table(as.matrix(y_test_1gene)))<2 | length(table(as.matrix(y_train_1gene)))<3){ # if <2 observations, will cause error in calculating PCC
                                             # notice that in training set, we need to do CV by leaving-1-out.
         result = list()
@@ -357,7 +359,7 @@ end_time <- Sys.time()
 end_time - start_time
 
 save(results_repeats,
-     file = paste0(pred_table_dir, "Mean_results_repeats_lasso_", filter_cell_num, ".RData"))
+     file = paste0(pred_table_dir, "Mean_results_repeats_lasso_", predict_mean_or_sd, '_', filter_cell_num, ".RData"))
 ```
 
 # Visualize prediction performance
